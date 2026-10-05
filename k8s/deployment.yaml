@@ -1,0 +1,150 @@
+# Enterprise AI Assistant — API Deployment
+#
+# Security hardening applied:
+#   - Non-root container (runAsUser: 1001, matches Dockerfile appuser)
+#   - Read-only root filesystem (tmp mounted separately)
+#   - No privilege escalation
+#   - All capabilities dropped
+#   - Resources: requests + limits prevent noisy-neighbour CPU steal
+#
+# Availability:
+#   - 2 replicas minimum (HPA in hpa.yaml scales to 10)
+#   - TopologySpreadConstraints: pods spread across availability zones
+#   - RollingUpdate with maxSurge=1, maxUnavailable=0 (zero-downtime deploys)
+#
+# Probes:
+#   - Liveness  → /api/v1/health        (is process alive?)
+#   - Readiness → /api/v1/health/db     (is DB connected? route traffic?)
+#   - Startup   → /api/v1/health        (give 60s for graph compilation on cold start)
+#
+apiVersion: apps/v1
+kind: Deployment
+metadata:
+  name: enterprise-ai-api
+  namespace: enterprise-ai
+  labels:
+    app.kubernetes.io/name: enterprise-ai-assistant
+    app.kubernetes.io/component: api
+    app.kubernetes.io/version: "1.0.0"
+  annotations:
+    # Record which image SHA is running for audit trail
+    deployment.kubernetes.io/revision: "1"
+spec:
+  replicas: 2
+  selector:
+    matchLabels:
+      app: enterprise-ai-api
+  strategy:
+    type: RollingUpdate
+    rollingUpdate:
+      maxSurge: 1          # allow 1 extra pod during rollout
+      maxUnavailable: 0    # never take a pod down before a new one is ready
+  template:
+    metadata:
+      labels:
+        app: enterprise-ai-api
+        app.kubernetes.io/name: enterprise-ai-assistant
+        app.kubernetes.io/component: api
+    spec:
+      # ── Security context (pod level) ────────────────────────────────────────
+      securityContext:
+        runAsNonRoot: true
+        runAsUser: 1001           # matches appuser in Dockerfile
+        runAsGroup: 1001
+        fsGroup: 1001
+        seccompProfile:
+          type: RuntimeDefault
+
+      # ── Spread pods across zones for HA ─────────────────────────────────────
+      topologySpreadConstraints:
+        - maxSkew: 1
+          topologyKey: topology.kubernetes.io/zone
+          whenUnsatisfiable: DoNotSchedule
+          labelSelector:
+            matchLabels:
+              app: enterprise-ai-api
+
+      # ── Graceful shutdown: drain in-flight requests ──────────────────────────
+      terminationGracePeriodSeconds: 30
+
+      containers:
+        - name: api
+          # Image tag is updated by CI via: kubectl set image deployment/enterprise-ai-api api=<new-tag>
+          image: ghcr.io/REPLACE_WITH_YOUR_GITHUB_ORG/enterprise-ai-assistant:latest
+          imagePullPolicy: Always
+
+          ports:
+            - containerPort: 8000
+              name: http
+              protocol: TCP
+
+          # ── Environment: non-secret config ────────────────────────────────────
+          envFrom:
+            - configMapRef:
+                name: enterprise-ai-config
+            - secretRef:
+                name: enterprise-ai-secrets
+
+          # ── Resources (tune per load test results) ──────────────────────────
+          # Request: guaranteed allocation; Limit: hard cap
+          # GPT-4o API calls are I/O-bound → CPU request can be low
+          # Memory: LangGraph state + model response buffering ≈ 512Mi
+          resources:
+            requests:
+              cpu: "250m"
+              memory: "512Mi"
+            limits:
+              cpu: "1000m"
+              memory: "1Gi"
+
+          # ── Container security context ───────────────────────────────────────
+          securityContext:
+            allowPrivilegeEscalation: false
+            readOnlyRootFilesystem: true
+            capabilities:
+              drop: ["ALL"]
+
+          # ── Volume mounts for read-only filesystem ───────────────────────────
+          volumeMounts:
+            - name: tmp
+              mountPath: /tmp          # uvicorn needs /tmp for .pid files
+            - name: app-cache
+              mountPath: /app/.cache   # tiktoken / transformers cache
+
+          # ── Probes ──────────────────────────────────────────────────────────
+          startupProbe:
+            # Allow 60s for graph compilation + DB pool warm-up on first start
+            httpGet:
+              path: /api/v1/health
+              port: http
+            failureThreshold: 12      # 12 × 5s = 60s total startup budget
+            periodSeconds: 5
+
+          livenessProbe:
+            httpGet:
+              path: /api/v1/health
+              port: http
+            initialDelaySeconds: 0    # startupProbe already ensures readiness
+            periodSeconds: 30
+            timeoutSeconds: 5
+            failureThreshold: 3
+
+          readinessProbe:
+            # Uses /health/db — checks real DB connectivity before routing traffic
+            httpGet:
+              path: /api/v1/health/db
+              port: http
+            initialDelaySeconds: 0
+            periodSeconds: 15
+            timeoutSeconds: 10
+            failureThreshold: 3
+
+      volumes:
+        - name: tmp
+          emptyDir: {}
+        - name: app-cache
+          emptyDir: {}
+
+      # ── Image pull secret (if using private registry) ────────────────────────
+      # imagePullSecrets:
+      #   - name: ghcr-pull-secret

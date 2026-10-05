@@ -1,0 +1,68 @@
+# Horizontal Pod Autoscaler for the API Deployment.
+#
+# Scaling triggers:
+#   CPU:    scale up when average CPU > 70% of request (250m → 175m threshold)
+#   Memory: scale up when average memory > 75% of request (512Mi → 384Mi threshold)
+#
+# Why both CPU and Memory?
+#   LangGraph agent pipelines are mostly I/O-bound (waiting for OpenAI API),
+#   so CPU alone won't trigger scaling under high concurrency. Memory is a
+#   better signal because buffering many in-flight LLM responses grows memory.
+#
+# Stabilization windows prevent thrashing:
+#   Scale-up:   stabilize 30s  — react quickly to traffic spikes
+#   Scale-down: stabilize 300s — don't aggressively remove pods during troughs
+#
+# Prerequisites: metrics-server must be installed in the cluster.
+#   kubectl apply -f https://github.com/kubernetes-sigs/metrics-server/releases/latest/download/components.yaml
+#
+apiVersion: autoscaling/v2
+kind: HorizontalPodAutoscaler
+metadata:
+  name: enterprise-ai-hpa
+  namespace: enterprise-ai
+  labels:
+    app.kubernetes.io/name: enterprise-ai-assistant
+    app.kubernetes.io/component: api
+spec:
+  scaleTargetRef:
+    apiVersion: apps/v1
+    kind: Deployment
+    name: enterprise-ai-api
+
+  minReplicas: 2    # always 2 for HA (one per AZ)
+  maxReplicas: 10   # cap at 10 to control OpenAI API cost at scale
+
+  metrics:
+    # ── CPU utilisation ───────────────────────────────────────────────────────
+    - type: Resource
+      resource:
+        name: cpu
+        target:
+          type: Utilization
+          averageUtilization: 70   # scale when avg pod CPU > 70% of request
+
+    # ── Memory utilisation ────────────────────────────────────────────────────
+    - type: Resource
+      resource:
+        name: memory
+        target:
+          type: Utilization
+          averageUtilization: 75   # scale when avg pod memory > 75% of request
+
+  behavior:
+    # ── Scale-up: fast ────────────────────────────────────────────────────────
+    scaleUp:
+      stabilizationWindowSeconds: 30
+      policies:
+        - type:          Pods
+          value:         2          # add up to 2 pods per scaling event
+          periodSeconds: 60
+
+    # ── Scale-down: slow (avoid premature scale-in during burst traffic) ──────
+    scaleDown:
+      stabilizationWindowSeconds: 300
+      policies:
+        - type:          Pods
+          value:         1          # remove at most 1 pod per 120s
+          periodSeconds: 120

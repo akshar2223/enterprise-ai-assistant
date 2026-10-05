@@ -1,0 +1,221 @@
+# PostgreSQL 16 + pgvector — StatefulSet for self-hosted k8s.
+#
+# For production on managed clouds, PREFER the managed service instead:
+#   AWS:   RDS PostgreSQL 16 with pgvector extension
+#   GCP:   Cloud SQL for PostgreSQL with pgvector
+#   Azure: Azure Database for PostgreSQL Flexible Server
+#
+# This StatefulSet is provided for:
+#   - Self-hosted / on-prem k8s clusters
+#   - Development / staging environments
+#   - Air-gapped deployments
+#
+# Data persistence: 50Gi PVC (adjust storageClassName for your cluster's CSI driver)
+# Backup: consider Velero or pg_dump CronJob for regular snapshots.
+#
+---
+# Headless Service for StatefulSet DNS (postgres-0.postgres-headless.enterprise-ai.svc.cluster.local)
+apiVersion: v1
+kind: Service
+metadata:
+  name: postgres-headless
+  namespace: enterprise-ai
+  labels:
+    app.kubernetes.io/name: enterprise-ai-assistant
+    app.kubernetes.io/component: database
+spec:
+  type: ClusterIP
+  clusterIP: None     # headless — DNS resolves to pod IPs directly
+  selector:
+    app: postgres
+  ports:
+    - name: postgres
+      port: 5432
+      targetPort: 5432
+
+---
+# ClusterIP Service for application connections (stable DNS: postgres-service.enterprise-ai.svc.cluster.local)
+apiVersion: v1
+kind: Service
+metadata:
+  name: postgres-service
+  namespace: enterprise-ai
+  labels:
+    app.kubernetes.io/name: enterprise-ai-assistant
+    app.kubernetes.io/component: database
+spec:
+  type: ClusterIP
+  selector:
+    app: postgres
+  ports:
+    - name: postgres
+      port: 5432
+      targetPort: 5432
+
+---
+# StatefulSet
+apiVersion: apps/v1
+kind: StatefulSet
+metadata:
+  name: postgres
+  namespace: enterprise-ai
+  labels:
+    app.kubernetes.io/name: enterprise-ai-assistant
+    app.kubernetes.io/component: database
+spec:
+  serviceName: postgres-headless
+  replicas: 1     # single primary for v1; upgrade to Patroni for HA
+  selector:
+    matchLabels:
+      app: postgres
+  template:
+    metadata:
+      labels:
+        app: postgres
+        app.kubernetes.io/component: database
+    spec:
+      securityContext:
+        runAsUser: 999     # postgres user inside the container
+        runAsGroup: 999
+        fsGroup: 999
+
+      terminationGracePeriodSeconds: 60    # allow pg to flush WAL on shutdown
+
+      containers:
+        - name: postgres
+          image: pgvector/pgvector:pg16
+          imagePullPolicy: IfNotPresent
+
+          ports:
+            - containerPort: 5432
+              name: postgres
+
+          env:
+            - name: POSTGRES_DB
+              valueFrom:
+                configMapKeyRef:
+                  name: enterprise-ai-config
+                  key: POSTGRES_DB
+            - name: POSTGRES_USER
+              valueFrom:
+                configMapKeyRef:
+                  name: enterprise-ai-config
+                  key: POSTGRES_USER
+            - name: POSTGRES_PASSWORD
+              valueFrom:
+                secretKeyRef:
+                  name: enterprise-ai-secrets
+                  key: POSTGRES_PASSWORD
+            # Tune shared_buffers to 25% of pod memory limit
+            - name: POSTGRES_INITDB_ARGS
+              value: "--encoding=UTF8 --locale=en_US.UTF-8"
+
+          resources:
+            requests:
+              cpu: "500m"
+              memory: "1Gi"
+            limits:
+              cpu: "2000m"
+              memory: "4Gi"
+
+          volumeMounts:
+            - name: postgres-data
+              mountPath: /var/lib/postgresql/data
+              subPath: postgres          # prevents "lost+found" issue on EBS
+            - name: init-scripts
+              mountPath: /docker-entrypoint-initdb.d
+
+          livenessProbe:
+            exec:
+              command: ["pg_isready", "-U", "postgres", "-d", "enterprise_ai"]
+            initialDelaySeconds: 30
+            periodSeconds: 10
+            failureThreshold: 6
+
+          readinessProbe:
+            exec:
+              command: ["pg_isready", "-U", "postgres", "-d", "enterprise_ai"]
+            initialDelaySeconds: 5
+            periodSeconds: 5
+            failureThreshold: 3
+
+      volumes:
+        - name: init-scripts
+          configMap:
+            name: postgres-init-scripts
+
+  # ── Persistent Volume Claim ────────────────────────────────────────────────
+  volumeClaimTemplates:
+    - metadata:
+        name: postgres-data
+      spec:
+        accessModes: ["ReadWriteOnce"]
+        storageClassName: "gp3"    # AWS EBS gp3; change to your CSI driver
+        resources:
+          requests:
+            storage: 50Gi
+
+---
+# ConfigMap carrying the init SQL (from db/init.sql)
+# In production, manage this separately or use an initContainer with a git clone.
+apiVersion: v1
+kind: ConfigMap
+metadata:
+  name: postgres-init-scripts
+  namespace: enterprise-ai
+  labels:
+    app.kubernetes.io/name: enterprise-ai-assistant
+    app.kubernetes.io/component: database
+data:
+  init.sql: |
+    -- Loaded from db/init.sql — run once on first container start.
+    -- In production, use Alembic migrations instead of this init script.
+    CREATE EXTENSION IF NOT EXISTS vector;
+    CREATE EXTENSION IF NOT EXISTS "pgcrypto";
+
+    CREATE TABLE IF NOT EXISTS enterprise_embeddings (
+        chunk_id     UUID PRIMARY KEY DEFAULT gen_random_uuid(),
+        doc_id       VARCHAR(255)    NOT NULL,
+        tenant_id    VARCHAR(64)     NOT NULL,
+        content      TEXT            NOT NULL,
+        metadata     JSONB           DEFAULT '{}'::jsonb,
+        embedding    vector(1536),
+        content_tsv  TSVECTOR        GENERATED ALWAYS AS (
+                         to_tsvector('english', content)
+                     ) STORED,
+        created_at   TIMESTAMPTZ     DEFAULT CURRENT_TIMESTAMP
+    );
+
+    CREATE INDEX IF NOT EXISTS idx_embeddings_hnsw ON enterprise_embeddings
+        USING hnsw (embedding vector_cosine_ops) WITH (m = 16, ef_construction = 64);
+    CREATE INDEX IF NOT EXISTS idx_embeddings_tenant ON enterprise_embeddings (tenant_id);
+    CREATE INDEX IF NOT EXISTS idx_embeddings_fts ON enterprise_embeddings USING gin (content_tsv);
+
+    CREATE TABLE IF NOT EXISTS audit_logs (
+        log_id           UUID PRIMARY KEY DEFAULT gen_random_uuid(),
+        conversation_id  VARCHAR(128)    NOT NULL,
+        tenant_id        VARCHAR(64)     NOT NULL,
+        user_id          VARCHAR(128),
+        event_type       VARCHAR(64)     NOT NULL,
+        agent_name       VARCHAR(64),
+        payload          JSONB           DEFAULT '{}'::jsonb,
+        latency_ms       INTEGER,
+        faithfulness_score NUMERIC(4,3),
+        created_at       TIMESTAMPTZ     DEFAULT CURRENT_TIMESTAMP
+    );
+
+    CREATE OR REPLACE RULE audit_logs_no_update AS ON UPDATE TO audit_logs DO INSTEAD NOTHING;
+    CREATE OR REPLACE RULE audit_logs_no_delete AS ON DELETE TO audit_logs DO INSTEAD NOTHING;
+
+    CREATE TABLE IF NOT EXISTS analytics_data (
+        record_id    UUID PRIMARY KEY DEFAULT gen_random_uuid(),
+        tenant_id    VARCHAR(64)     NOT NULL,
+        region       VARCHAR(64),
+        department   VARCHAR(128),
+        metric_name  VARCHAR(128),
+        metric_value NUMERIC(18, 4),
+        period       VARCHAR(20),
+        tags         JSONB           DEFAULT '{}'::jsonb,
+        source_file  VARCHAR(255),
+        created_at   TIMESTAMPTZ     DEFAULT CURRENT_TIMESTAMP
+    );

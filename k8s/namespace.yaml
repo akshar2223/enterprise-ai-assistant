@@ -1,0 +1,7 @@
+apiVersion: v1
+kind: Namespace
+metadata:
+  name: enterprise-ai
+  labels:
+    app.kubernetes.io/name: enterprise-ai-assistant
+    environment: production

@@ -1,0 +1,63 @@
+# Nginx Ingress — terminates TLS, routes /api/v1/* to the API service.
+#
+# Prerequisites:
+#   kubectl apply -f https://raw.githubusercontent.com/kubernetes/ingress-nginx/controller-v1.10.0/deploy/static/provider/cloud/deploy.yaml
+#
+# TLS certificate: managed by cert-manager (Let's Encrypt).
+# Install cert-manager: https://cert-manager.io/docs/installation/
+#
+# Replace `ai.yourdomain.com` with your actual domain.
+#
+apiVersion: networking.k8s.io/v1
+kind: Ingress
+metadata:
+  name: enterprise-ai-ingress
+  namespace: enterprise-ai
+  labels:
+    app.kubernetes.io/name: enterprise-ai-assistant
+  annotations:
+    # Nginx annotations
+    nginx.ingress.kubernetes.io/rewrite-target:         /
+    nginx.ingress.kubernetes.io/proxy-body-size:        "1m"
+    nginx.ingress.kubernetes.io/proxy-read-timeout:     "60"
+    nginx.ingress.kubernetes.io/proxy-send-timeout:     "60"
+
+    # Rate limiting at ingress level (backs up application-level slowapi)
+    nginx.ingress.kubernetes.io/limit-rps:              "10"
+    nginx.ingress.kubernetes.io/limit-connections:      "20"
+
+    # TLS via cert-manager (Let's Encrypt)
+    cert-manager.io/cluster-issuer:                     "letsencrypt-prod"
+
+    # Security headers
+    nginx.ingress.kubernetes.io/configuration-snippet: |
+      more_set_headers "X-Frame-Options: DENY";
+      more_set_headers "X-Content-Type-Options: nosniff";
+      more_set_headers "X-XSS-Protection: 1; mode=block";
+      more_set_headers "Referrer-Policy: strict-origin-when-cross-origin";
+      more_set_headers "Strict-Transport-Security: max-age=31536000; includeSubDomains";
+spec:
+  ingressClassName: nginx
+  tls:
+    - hosts:
+        - ai.yourdomain.com        # ← replace with your domain
+      secretName: enterprise-ai-tls
+  rules:
+    - host: ai.yourdomain.com      # ← replace with your domain
+      http:
+        paths:
+          - path: /api/v1
+            pathType: Prefix
+            backend:
+              service:
+                name: enterprise-ai-service
+                port:
+                  name: http
+          # Health endpoints accessible without auth (for uptime monitoring)
+          - path: /api/v1/health
+            pathType: Prefix
+            backend:
+              service:
+                name: enterprise-ai-service
+                port:
+                  name: http

@@ -1,0 +1,247 @@
+# ── Enterprise AI Assistant — CI/CD Pipeline ──────────────────────────────────
+#
+# Jobs:
+#   1. test         — pytest (unit + integration, mocked)        → all PRs + main
+#   2. lint         — ruff (code quality)                        → all PRs + main
+#   3. docker-build — multi-stage Docker build + push to GHCR   → main only
+#   4. deploy       — kubectl rollout to k8s cluster             → main only
+#
+# Required GitHub Secrets (Settings → Secrets → Actions):
+#   OPENAI_API_KEY      — for test env (uses dummy key; real key for integration)
+#   POSTGRES_PASSWORD   — Kubernetes DB password
+#   JWT_SECRET_KEY      — minimum 32 chars
+#   DATABASE_URL        — postgresql://... for production DB
+#   KUBECONFIG          — base64-encoded kubeconfig for your cluster
+#
+# Image registry: GitHub Container Registry (ghcr.io)
+#   Images are tagged with both the Git SHA (immutable) and 'latest' (mutable).
+#
+name: CI/CD
+
+on:
+  push:
+    branches: [main]
+  pull_request:
+    branches: [main]
+
+env:
+  REGISTRY:    ghcr.io
+  IMAGE_NAME:  ${{ github.repository }}
+  PYTHON_VER:  "3.11"
+  K8S_NS:      enterprise-ai
+  K8S_DEPLOY:  enterprise-ai-api
+
+jobs:
+  # ── Job 1: Test ─────────────────────────────────────────────────────────────
+  test:
+    name: "🧪 pytest (46 tests)"
+    runs-on: ubuntu-latest
+    timeout-minutes: 15
+
+    env:
+      # Injected for tests — fake key safe for unit/integration tests
+      OPENAI_API_KEY:      "sk-test-ci-fake-key-for-unit-tests-only"
+      DATABASE_URL:        "postgresql://postgres:test@localhost:5432/test_db"
+      POSTGRES_PASSWORD:   "test"
+      JWT_SECRET_KEY:      "ci-test-secret-key-minimum-32-characters!"
+      APP_ENV:             "test"
+
+    steps:
+      - name: Checkout
+        uses: actions/checkout@v4
+
+      - name: Set up Python ${{ env.PYTHON_VER }}
+        uses: actions/setup-python@v5
+        with:
+          python-version: ${{ env.PYTHON_VER }}
+          cache: pip
+
+      - name: Install dependencies
+        run: |
+          pip install --upgrade pip
+          # Install only test-relevant packages (skip pyspark/torch for CI speed)
+          pip install \
+            sqlglot==23.6.3 \
+            pydantic==2.6.4 \
+            pydantic-settings==2.2.1 \
+            python-dotenv==1.0.1 \
+            "python-jose[cryptography]==3.3.0" \
+            tiktoken==0.6.0 \
+            pytest==8.1.1 \
+            pytest-asyncio==0.23.6 \
+            structlog==24.1.0 \
+            fastapi==0.110.0 \
+            httpx==0.27.0 \
+            openai==1.14.1 \
+            "langchain==0.1.16" \
+            "langchain-core==0.1.46" \
+            "langgraph==0.0.39" \
+            asyncpg==0.29.0 \
+            pgvector==0.2.5 \
+            psycopg2-binary==2.9.9 \
+            slowapi==0.1.9
+
+      - name: Run tests
+        run: pytest tests/ -v --tb=short --junit-xml=test-results.xml
+
+      - name: Upload test results
+        uses: actions/upload-artifact@v4
+        if: always()
+        with:
+          name: test-results
+          path: test-results.xml
+
+
+  # ── Job 2: Lint ─────────────────────────────────────────────────────────────
+  lint:
+    name: "🔍 ruff lint"
+    runs-on: ubuntu-latest
+    timeout-minutes: 5
+
+    steps:
+      - uses: actions/checkout@v4
+
+      - uses: actions/setup-python@v5
+        with:
+          python-version: ${{ env.PYTHON_VER }}
+          cache: pip
+
+      - name: Install ruff
+        run: pip install ruff==0.3.5
+
+      - name: Run ruff
+        run: |
+          ruff check . \
+            --exclude venv,__pycache__,.git \
+            --select E,F,W,I \
+            --ignore E501   # line length — handled by formatter
+
+
+  # ── Job 3: Docker Build & Push ───────────────────────────────────────────────
+  docker-build:
+    name: "🐳 Docker build & push"
+    runs-on: ubuntu-latest
+    needs: [test, lint]
+    # Only push on main branch; PRs only build (no push)
+    if: github.event_name == 'push' && github.ref == 'refs/heads/main'
+    timeout-minutes: 20
+
+    permissions:
+      contents: read
+      packages: write    # needed to push to GHCR
+
+    outputs:
+      image-tag: ${{ steps.meta.outputs.tags }}
+      image-digest: ${{ steps.build.outputs.digest }}
+
+    steps:
+      - uses: actions/checkout@v4
+
+      - name: Set up Docker Buildx
+        uses: docker/setup-buildx-action@v3
+
+      - name: Log in to GitHub Container Registry
+        uses: docker/login-action@v3
+        with:
+          registry: ${{ env.REGISTRY }}
+          username: ${{ github.actor }}
+          password: ${{ secrets.GITHUB_TOKEN }}
+
+      - name: Extract Docker metadata (tags + labels)
+        id: meta
+        uses: docker/metadata-action@v5
+        with:
+          images: ${{ env.REGISTRY }}/${{ env.IMAGE_NAME }}
+          tags: |
+            type=sha,format=long,prefix=sha-     # immutable: sha-<40-char-sha>
+            type=raw,value=latest                 # mutable: latest (main branch only)
+
+      - name: Build and push
+        id: build
+        uses: docker/build-push-action@v5
+        with:
+          context: .
+          file: ./deployment/Dockerfile
+          push: true
+          tags: ${{ steps.meta.outputs.tags }}
+          labels: ${{ steps.meta.outputs.labels }}
+          # GitHub Actions cache — speeds up layer rebuilds on unchanged deps
+          cache-from: type=gha
+          cache-to:   type=gha,mode=max
+
+      - name: Output image digest
+        run: echo "Image digest ${{ steps.build.outputs.digest }}"
+
+
+  # ── Job 4: Deploy to Kubernetes ──────────────────────────────────────────────
+  deploy:
+    name: "🚀 Deploy to k8s"
+    runs-on: ubuntu-latest
+    needs: [docker-build]
+    if: github.event_name == 'push' && github.ref == 'refs/heads/main'
+    timeout-minutes: 15
+
+    environment:
+      name: production          # GitHub environment for approval gates + logs
+      url: https://ai.yourdomain.com
+
+    steps:
+      - uses: actions/checkout@v4
+
+      - name: Set up kubectl
+        uses: azure/setup-kubectl@v3
+        with:
+          version: v1.30.0
+
+      - name: Configure kubeconfig
+        run: |
+          mkdir -p ~/.kube
+          echo "${{ secrets.KUBECONFIG }}" | base64 -d > ~/.kube/config
+          chmod 600 ~/.kube/config
+
+      - name: Apply namespace + ConfigMap
+        run: |
+          kubectl apply -f k8s/namespace.yaml
+          kubectl apply -f k8s/configmap.yaml
+
+      - name: Upsert Kubernetes secrets from CI secrets
+        # --dry-run=client -o yaml | kubectl apply → idempotent secret upsert
+        run: |
+          kubectl create secret generic enterprise-ai-secrets \
+            --namespace=${{ env.K8S_NS }} \
+            --from-literal=OPENAI_API_KEY="${{ secrets.OPENAI_API_KEY }}" \
+            --from-literal=POSTGRES_PASSWORD="${{ secrets.POSTGRES_PASSWORD }}" \
+            --from-literal=JWT_SECRET_KEY="${{ secrets.JWT_SECRET_KEY }}" \
+            --from-literal=DATABASE_URL="${{ secrets.DATABASE_URL }}" \
+            --dry-run=client -o yaml | kubectl apply -f -
+
+      - name: Apply k8s manifests (service, ingress, hpa)
+        run: |
+          kubectl apply -f k8s/service.yaml
+          kubectl apply -f k8s/ingress.yaml
+          kubectl apply -f k8s/hpa.yaml
+
+      - name: Roll out new image
+        run: |
+          IMAGE="${{ env.REGISTRY }}/${{ env.IMAGE_NAME }}:sha-${{ github.sha }}"
+          echo "Deploying image: $IMAGE"
+          kubectl set image deployment/${{ env.K8S_DEPLOY }} \
+            api="$IMAGE" \
+            --namespace=${{ env.K8S_NS }}
+
+      - name: Wait for rollout to complete
+        run: |
+          kubectl rollout status deployment/${{ env.K8S_DEPLOY }} \
+            --namespace=${{ env.K8S_NS }} \
+            --timeout=5m
+
+      - name: Smoke test — liveness endpoint
+        run: |
+          sleep 10
+          kubectl run smoke-test \
+            --image=curlimages/curl:latest \
+            --restart=Never \
+            --namespace=${{ env.K8S_NS }} \
+            --rm -i \
+            -- curl -sf http://enterprise-ai-service/api/v1/health
+          echo "✅ Smoke test passed"

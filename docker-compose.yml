@@ -1,0 +1,50 @@
+services:
+  # ── PostgreSQL 16 + pgvector ─────────────────────────────────────────────────
+  # ankane/pgvector is the official pgvector-enabled Postgres image.
+  # It pins to PG 16 and always ships the latest pgvector release.
+  db:
+    image: pgvector/pgvector:pg16
+    container_name: enterprise_ai_postgres
+    restart: unless-stopped
+    environment:
+      POSTGRES_DB: enterprise_ai
+      POSTGRES_USER: postgres
+      POSTGRES_PASSWORD: change_me_in_prod
+    ports:
+      - "5432:5432"
+    volumes:
+      - pgdata:/var/lib/postgresql/data
+      - ./db/init.sql:/docker-entrypoint-initdb.d/init.sql:ro
+    healthcheck:
+      test: ["CMD-SHELL", "pg_isready -U postgres -d enterprise_ai"]
+      interval: 10s
+      timeout: 5s
+      retries: 5
+      start_period: 30s
+
+  # ── FastAPI Application ──────────────────────────────────────────────────────
+  api:
+    build:
+      context: .
+      dockerfile: deployment/Dockerfile
+    container_name: enterprise_ai_api
+    restart: unless-stopped
+    env_file:
+      - .env
+    environment:
+      # Override DB host to point to the compose service, not localhost
+      POSTGRES_HOST: db
+      DATABASE_URL: postgresql://postgres:change_me_in_prod@db:5432/enterprise_ai
+    ports:
+      - "8000:8000"
+    depends_on:
+      db:
+        condition: service_healthy
+    volumes:
+      # Mount source code for hot-reload in development
+      - .:/app
+    command: uvicorn deployment.main:app --host 0.0.0.0 --port 8000 --reload
+
+volumes:
+  pgdata:
+    driver: local

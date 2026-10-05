@@ -1,0 +1,24 @@
+# Non-secret configuration — safe to commit.
+# Secrets (API keys, passwords) live in k8s/secret.yaml and are injected via CI.
+apiVersion: v1
+kind: ConfigMap
+metadata:
+  name: enterprise-ai-config
+  namespace: enterprise-ai
+  labels:
+    app.kubernetes.io/name: enterprise-ai-assistant
+data:
+  APP_ENV:                    "production"
+  LOG_LEVEL:                  "INFO"
+  OPENAI_CHAT_MODEL:          "gpt-4o"
+  OPENAI_EMBEDDING_MODEL:     "text-embedding-3-large"
+  POSTGRES_HOST:              "postgres-service"      # k8s Service name for DB
+  POSTGRES_PORT:              "5432"
+  POSTGRES_DB:                "enterprise_ai"
+  POSTGRES_USER:              "postgres"
+  JWT_ALGORITHM:              "HS256"
+  JWT_ACCESS_TOKEN_EXPIRE_MINUTES: "60"
+  API_RATE_LIMIT_PER_MINUTE:  "60"
+  VECTOR_SEARCH_TOP_K:        "5"
+  FAITHFULNESS_THRESHOLD:     "0.96"
+  SQL_QUERY_MAX_ROWS:         "100"
